@@ -16,7 +16,9 @@
     "event_code": "ET00451914",
     "region_slug": "kolkata",
     "slug": "namit-malhotras-ramayana-hindi",
-    "dates": [],
+    "dates": [
+      "20261106"
+    ],
     "theatres": [],
     "times": [],
     "enabled": true
