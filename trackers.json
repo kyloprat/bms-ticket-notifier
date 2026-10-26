@@ -9,5 +9,16 @@
     "theatres": [],
     "times": [],
     "enabled": true
+  },
+  {
+    "id": "et00451914-kolkata",
+    "label": "Namit Malhotras Ramayana Hindi",
+    "event_code": "ET00451914",
+    "region_slug": "kolkata",
+    "slug": "namit-malhotras-ramayana-hindi",
+    "dates": [],
+    "theatres": [],
+    "times": [],
+    "enabled": true
   }
 ]
