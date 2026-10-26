@@ -33,6 +33,9 @@ RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 RESEND_TO_EMAIL = os.getenv("RESEND_TO_EMAIL", "")
 RESEND_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "aviiciii@resend.dev")
 
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
 STATE_FILE = "bms_state.json"
 
 # ──────────────────────────────────────────────────────────────────────
@@ -521,6 +524,32 @@ def send_email(subject, changes, shows, movie_info):
         sys.exit(1)
 
 
+def send_telegram(subject, changes, url):
+    token, chat = TELEGRAM_BOT_TOKEN.strip(), TELEGRAM_CHAT_ID.strip()
+    if not token or not chat:
+        print("  ⚠️  Skipping Telegram — TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set.")
+        return
+    lines = [subject, ""] + changes[:15]
+    if len(changes) > 15:
+        lines.append(f"…and {len(changes) - 15} more")
+    lines += ["", url]
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat, "text": "\n".join(lines)[:4000],
+                  "disable_web_page_preview": True},
+            timeout=15,
+        )
+        if resp.ok:
+            print("  ✅ Telegram sent")
+        else:
+            print(f"  ❌ Telegram {resp.status_code}: {resp.text[:200]}")
+            sys.exit(1)
+    except requests.RequestException as e:
+        print(f"  ❌ Telegram failed: {e}")
+        sys.exit(1)
+
+
 # ──────────────────────────────────────────────────────────────────────
 # MAIN
 # ──────────────────────────────────────────────────────────────────────
@@ -592,8 +621,13 @@ def main():
     old_state = load_state()
 
     changes = []
-    if old_state:
+    if old_state.get("shows"):
         changes = detect_changes(old_state, new_state)
+    elif new_state["shows"]:
+        # first time any showtime is seen = bookings just opened
+        theatres = sorted({v["venue"] for v in new_state["shows"].values()})
+        changes = [f"🎟️ BOOKINGS OPEN: {len(new_state['shows'])} show/category slots "
+                   f"at {len(theatres)} theatre(s)"] + [f"   {t}" for t in theatres[:8]]
 
     save_state(new_state)
 
@@ -601,10 +635,9 @@ def main():
         print(f"\n  ⚡ {len(changes)} change(s) detected:")
         for c in changes:
             print(f"     {c}")
-        send_email(
-            f"BMS Alert: {movie_info['name']} - {len(changes)} change(s)",
-            changes, filtered, movie_info,
-        )
+        subject = f"BMS Alert: {movie_info['name']} - {len(changes)} change(s)"
+        send_telegram(subject, changes, CONFIG["url"])
+        send_email(subject, changes, filtered, movie_info)
     else:
         print("  ✅ No changes since last check.")
 
