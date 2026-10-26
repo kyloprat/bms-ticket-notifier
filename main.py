@@ -583,6 +583,11 @@ def humanize(minutes):
     return f"every {minutes} minutes"
 
 
+def movie_page_url():
+    """The movie page works before bookings open; /buytickets/ shows 'no shows' until then."""
+    return re.sub(r"/buytickets/(ET\d+)/?", r"/", CONFIG["url"])
+
+
 def finish(meta, now, hb_due, phase, schedule, result, ok):
     """Record the check; send the daily 'still watching' note and a one-time failure warning."""
     meta["last_check"] = now.isoformat(timespec="minutes")
@@ -598,7 +603,7 @@ def finish(meta, now, hb_due, phase, schedule, result, ok):
                  f"Checking {humanize(phase['every_minutes'])} for now."]
         if schedule.get("estimate"):
             lines.append(schedule["estimate"])
-        send_telegram(f"🫡 Still watching {label}", lines, CONFIG["url"])
+        send_telegram(f"🫡 Still watching {label}", lines, movie_page_url())
         meta["last_heartbeat"] = now.date().isoformat()
     with open(META_FILE, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)

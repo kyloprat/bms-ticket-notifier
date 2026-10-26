@@ -1,11 +1,7 @@
 {
   "label": "Avengers: Doomsday (Bengaluru)",
-  "estimate": "Release 18 Dec 2026 (India may get 17 Dec). Estimate: IMAX/4DX bookings ~5 Nov, regular shows ~4-5 Dec, from how Brand New Day was handled; unconfirmed, could be earlier.",
+  "estimate": "Release 18 Dec 2026 (India may get 17 Dec). Bookings could open any time; checking every 10 min so you hear first.",
   "phases": [
-    {"until": "2026-10-29", "every_minutes": 10},
-    {"until": "2026-11-01", "every_minutes": 1440},
-    {"until": "2026-11-20", "every_minutes": 180},
-    {"until": "2026-12-01", "every_minutes": 60},
-    {"until": "2027-01-01", "every_minutes": 10}
+    {"until": "", "every_minutes": 10}
   ]
 }
