@@ -39,7 +39,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 STATE_FILE = "bms_state.json"
 META_FILE = "meta.json"            # last check / last heartbeat / failure count
 SCHEDULE_FILE = "schedule.json"    # how often to really check, by date
-HEARTBEAT_HOUR = int(os.getenv("HEARTBEAT_HOUR", "10"))   # IST
+HEARTBEAT_HOUR = int(os.getenv("HEARTBEAT_HOUR", "20"))   # IST: one "still watching" note a day, 8 pm
 IST = timezone(timedelta(hours=5, minutes=30))
 
 # ──────────────────────────────────────────────────────────────────────
