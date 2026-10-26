@@ -3,7 +3,7 @@ BMS Ticket Checker — CI/Headless mode for GitHub Actions.
 Runs once, checks all configured watches, emails on changes.
 State is persisted via a JSON artifact.
 
-Configure via environment variables or edit the CONFIG below.
+What to watch lives in trackers.json and is managed from Telegram (see chat.py).
 """
 
 import os
@@ -16,18 +16,8 @@ from dataclasses import dataclass, field
 from urllib.parse import urlparse
 import requests
 
-# ──────────────────────────────────────────────────────────────────────
-# CONFIGURATION — edit these or set via env vars
-# ──────────────────────────────────────────────────────────────────────
-CONFIG = {
-    "url": os.getenv(
-        "BMS_URL",
-        "https://in.bookmyshow.com/movies/chennai/dhurandhar-the-revenge/buytickets/ET00478890"
-    ),
-    "dates": os.getenv("BMS_DATES", ""),          # comma-separated YYYYMMDD, empty = from URL
-    "theatre": os.getenv("BMS_THEATRE", ""),       # substring filter, empty = all
-    "time_period": os.getenv("BMS_TIME", ""),      # e.g. "evening,night", empty = all
-}
+from chat import Chat, ConsoleTelegram, Telegram, buy_url
+from district import check_district, district_url
 
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 RESEND_TO_EMAIL = os.getenv("RESEND_TO_EMAIL", "")
@@ -38,7 +28,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 STATE_FILE = "bms_state.json"
 META_FILE = "meta.json"            # last check / last heartbeat / failure count
-SCHEDULE_FILE = "schedule.json"    # how often to really check, by date
+TRACKERS_FILE = "trackers.json"    # what to watch (managed from Telegram)
 HEARTBEAT_HOUR = int(os.getenv("HEARTBEAT_HOUR", "20"))   # IST: one "still watching" note a day, 8 pm
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -522,40 +512,16 @@ def send_email(subject, changes, shows, movie_info):
             print(f"  ✅ Email sent to {to}")
         else:
             print(f"  ❌ Resend {resp.status_code}: {resp.text}")
-            sys.exit(1)
+            return
     except requests.RequestException as e:
         print(f"  ❌ Email failed: {e}")
-        sys.exit(1)
-
-
-def send_telegram(subject, changes, url):
-    token, chat = TELEGRAM_BOT_TOKEN.strip(), TELEGRAM_CHAT_ID.strip()
-    if not token or not chat:
-        print("  ⚠️  Skipping Telegram — TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set.")
         return
-    lines = [subject, ""] + changes[:15]
-    if len(changes) > 15:
-        lines.append(f"…and {len(changes) - 15} more")
-    lines += ["", url]
-    try:
-        resp = requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat, "text": "\n".join(lines)[:4000],
-                  "disable_web_page_preview": True},
-            timeout=15,
-        )
-        if resp.ok:
-            print("  ✅ Telegram sent")
-        else:
-            print(f"  ❌ Telegram {resp.status_code}: {resp.text[:200]}")
-            sys.exit(1)
-    except requests.RequestException as e:
-        print(f"  ❌ Telegram failed: {e}")
-        sys.exit(1)
+
+
 
 
 # ──────────────────────────────────────────────────────────────────────
-# SCHEDULE + HEARTBEAT (cron fires every 10 min; this decides if a check is due)
+# RUN: answer chat messages, check every tracker, send alerts + the daily note
 # ──────────────────────────────────────────────────────────────────────
 def load_json(path, default):
     try:
@@ -565,171 +531,130 @@ def load_json(path, default):
         return default
 
 
-def current_phase(schedule, now):
-    phases = schedule.get("phases") or [{"until": "", "every_minutes": 10}]
-    for ph in phases:
-        if not ph.get("until") or now < datetime.fromisoformat(ph["until"]).replace(tzinfo=IST):
-            return ph
-    return phases[-1]
+def write_json_if_changed(path, data):
+    """Only touch the file when content changed, so the bot doesn't commit every run."""
+    new = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    try:
+        with open(path, encoding="utf-8") as f:
+            if f.read() == new:
+                return
+    except FileNotFoundError:
+        pass
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(new)
 
 
-def humanize(minutes):
-    if minutes >= 1440:
-        return "once a day"
-    if minutes >= 120:
-        return f"every {minutes // 60} hours"
-    if minutes >= 60:
-        return "every hour"
-    return f"every {minutes} minutes"
+def make_telegram():
+    token, chat = os.getenv("TELEGRAM_BOT_TOKEN", "").strip(), os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if token and chat:
+        return Telegram(token, chat)
+    print("  ⚠️  TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set - printing instead.")
+    return ConsoleTelegram()
 
 
-def movie_page_url():
-    """The movie page works before bookings open; /buytickets/ shows 'no shows' until then."""
-    return re.sub(r"/buytickets/(ET\d+)/?", r"/\1", CONFIG["url"])
-
-
-def finish(meta, now, hb_due, phase, schedule, result, ok):
-    """Record the check; send the daily 'still watching' note and a one-time failure warning."""
-    meta["last_check"] = now.isoformat(timespec="minutes")
-    meta["last_result"] = result
-    meta["fails"] = 0 if ok else meta.get("fails", 0) + 1
-    label = schedule.get("label", "the movie")
-    if meta["fails"] == 3:
-        send_telegram(f"⚠️ Can't read BookMyShow for {label}", [
-            "3 checks in a row got no data. The site may be blocking GitHub, so check manually."],
-            CONFIG["url"])
-    if hb_due:
-        lines = [f"Last check: {result}",
-                 f"Checking {humanize(phase['every_minutes'])} for now."]
-        if schedule.get("estimate"):
-            lines.append(schedule["estimate"])
-        send_telegram(f"🫡 Still watching {label}", lines, movie_page_url())
-        meta["last_heartbeat"] = now.date().isoformat()
-    with open(META_FILE, "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2)
-
-
-# ──────────────────────────────────────────────────────────────────────
-# MAIN
-# ──────────────────────────────────────────────────────────────────────
-def main():
-    now = datetime.now(IST)
-    print(f"[{now:%Y-%m-%d %H:%M:%S} IST] BMS Ticket Checker — CI mode")
-
-    schedule = load_json(SCHEDULE_FILE, {})
-    meta = load_json(META_FILE, {})
-    phase = current_phase(schedule, now)
-    every = int(phase["every_minutes"])
-    hb_due = (now.hour >= HEARTBEAT_HOUR
-              and meta.get("last_heartbeat") != now.date().isoformat())
-    last = meta.get("last_check")
-    elapsed = ((now - datetime.fromisoformat(last)).total_seconds() / 60) if last else 1e9
-    forced = os.getenv("GITHUB_EVENT_NAME") == "workflow_dispatch"
-    if not (forced or hb_due or elapsed >= every - 5):
-        print(f"  ⏭️  Not due: phase checks {humanize(every)}, last check {elapsed:.0f} min ago.")
-        return
-
-    # Parse config
-    parsed = parse_bms_url(CONFIG["url"])
-    event_code = parsed["event_code"]
-    region_slug = parsed["region_slug"]
-    url_date = parsed.get("date_code", "")
-
-    if not event_code or not region_slug:
-        print("  ❌ Invalid BMS_URL. Could not extract event/region.")
-        sys.exit(1)
-
-    region_code, region_slug_r, lat, lon, geohash = resolve_region(
-        region_slug
-    )
-
-    # Determine dates to check
-    raw_dates = CONFIG["dates"].strip()
-    if raw_dates:
-        date_list = [d.strip() for d in raw_dates.split(",") if d.strip()]
-    elif url_date:
-        date_list = [url_date]
-    else:
-        date_list = [""]
-
-    print(f"  Event: {event_code}  Region: {region_code}  "
-          f"Dates: {date_list}")
-
-    # Fetch data for each date
-    all_shows = []
-    all_dates = []
+def check_bms(t, old, fetch=fetch_bms):
+    """One BookMyShow tracker -> dict(ok, result, state, changes, shows, movie_info)."""
+    region_code, region_slug, lat, lon, geohash = resolve_region(t["region_slug"])
+    all_shows, all_dates, got = [], [], False
     movie_info = {"name": "Unknown", "language": ""}
-    got_data = False
-
-    for dc in date_list:
-        data = fetch_bms(event_code, dc, region_code,
-                         region_slug_r, lat, lon, geohash)
+    for dc in (t.get("dates") or [""]):
+        data = fetch(t["event_code"], dc, region_code, region_slug, lat, lon, geohash)
         if not data:
-            print(f"  ⚠️  No data for date {dc or '(default)'}")
             continue
-        got_data = True
-
+        got = True
         if movie_info["name"] == "Unknown":
             movie_info = parse_movie_info(data)
-
         all_dates.extend(parse_dates(data))
         all_shows.extend(parse_shows(data))
-
     if not all_shows:
-        print("  ❌ No showtimes found.")
-        finish(meta, now, hb_due, phase, schedule,
-               "no showtimes listed yet" if got_data else "BookMyShow gave no data", got_data)
-        return
+        return {"ok": got, "result": "no showtimes listed yet" if got else "BookMyShow gave no data",
+                "state": None, "changes": [], "shows": [], "movie_info": movie_info}
 
-    print(f"  🎬 {movie_info['name']}  {movie_info['language']}")
-
-    # Apply filters
-    filtered = filter_shows(
-        all_shows,
-        CONFIG["theatre"],
-        CONFIG["time_period"],
-        CONFIG["dates"],
-    )
-    print(f"  📊 {len(filtered)} showtime(s) after filters")
-
-    # Build state & detect changes
+    filtered = filter_shows(all_shows, ",".join(t.get("theatres", [])), ",".join(t.get("times", [])),
+                            ",".join(t.get("dates", [])))
     new_state = build_state(filtered, all_dates)
-    old_state = load_state()
-
     changes = []
-    if old_state.get("shows"):
-        changes = detect_changes(old_state, new_state)
+    if old.get("shows"):
+        changes = detect_changes(old, new_state)
     elif new_state["shows"]:
-        # first time any showtime is seen = bookings just opened
         theatres = sorted({v["venue"] for v in new_state["shows"].values()})
         changes = [f"🎟️ BOOKINGS OPEN: {len(new_state['shows'])} show/category slots "
-                   f"at {len(theatres)} theatre(s)"] + [f"   {t}" for t in theatres[:8]]
+                   f"at {len(theatres)} theatre(s)"] + [f"   {x}" for x in theatres[:8]]
+    return {"ok": True, "result": f"{len(filtered)} showtimes listed", "state": new_state,
+            "changes": changes, "shows": filtered, "movie_info": movie_info}
 
-    save_state(new_state)
 
-    if changes:
-        print(f"\n  ⚡ {len(changes)} change(s) detected:")
-        for c in changes:
-            print(f"     {c}")
-        subject = f"BMS Alert: {movie_info['name']} - {len(changes)} change(s)"
-        send_telegram(subject, changes, CONFIG["url"])
-        send_email(subject, changes, filtered, movie_info)
-    else:
-        print("  ✅ No changes since last check.")
+def run(now=None, tg=None, fetch=fetch_bms, district_check=check_district):
+    now = now or datetime.now(IST)
+    print(f"[{now:%Y-%m-%d %H:%M:%S} IST] BMS Ticket Checker")
+    trackers = load_json(TRACKERS_FILE, [])
+    meta = load_json(META_FILE, {})
+    state = load_state()
+    if "shows" in state:                      # old single-movie format
+        state = {}
+    tg = tg or make_telegram()
 
-    # Print current status
-    print(f"\n  Current status ({len(filtered)} shows):")
-    for s in filtered:
-        cats = ", ".join(
-            f"{c.name}=₹{c.price}({AVAIL_STATUS_MAP.get(c.status, ('?',''))[0]})"
-            for c in s.categories
-        )
-        fmt = f"|{s.screen_attr}" if s.screen_attr else ""
-        print(f"    {s.venue_name} — {s.time}{fmt} [{s.date_code}] — {cats}")
+    # 1. chat: links, buttons and commands sent since the last run
+    chat = Chat(tg, trackers, meta, state, now.date(), region_ok=lambda slug: slug in REGION_MAP)
+    for update in tg.updates(meta.get("tg_offset")):
+        meta["tg_offset"] = update["update_id"] + 1
+        try:
+            chat.handle(update)
+        except Exception as e:  # noqa: BLE001 - one bad message must not stop the checks
+            print(f"  ❌ chat update failed: {e!r}")
+            tg.send(f"⚠️ Couldn't process that message ({type(e).__name__}).")
 
-    finish(meta, now, hb_due, phase, schedule, f"{len(filtered)} showtimes listed", True)
-    print("\n  Done.")
+    # 2. checks
+    results = meta.setdefault("results", {})
+    bms_ran = bms_ok = False
+    for t in trackers:
+        if not t.get("enabled", True):
+            continue
+        if t.get("source") == "district":
+            ok, result, is_open = district_check(t)
+            was_open = state.get(t["id"], {}).get("open", False)
+            if ok:
+                state[t["id"]] = {"open": is_open}
+            if is_open and not was_open:
+                tg.send(f"🎟️ BOOKINGS OPEN on District: {t['label']} ({t['city']})\n{result}\n"
+                        f"{district_url(t)}")
+        else:
+            bms_ran = True
+            r = check_bms(t, state.get(t["id"], {}), fetch)
+            ok, result = r["ok"], r["result"]
+            bms_ok = bms_ok or ok
+            if r["state"] is not None:
+                state[t["id"]] = r["state"]
+            if r["changes"]:
+                subject = f"BMS Alert: {t['label']} - {len(r['changes'])} change(s)"
+                lines = [subject, ""] + r["changes"][:15] + ["", buy_url(t)]
+                tg.send("\n".join(lines))
+                send_email(subject, r["changes"], r["shows"], r["movie_info"])
+        results[t["id"]] = result
+        print(f"  {t['id']}: {result}")
+    for tid in [k for k in results if not any(t["id"] == k for t in trackers)]:
+        results.pop(tid)
+
+    # 3. one-time warning if BookMyShow keeps returning nothing; one "still watching" note a day
+    if bms_ran:
+        meta["fails"] = 0 if bms_ok else meta.get("fails", 0) + 1
+        if meta["fails"] == 3:
+            tg.send("⚠️ Can't read BookMyShow: 3 checks in a row got no data. "
+                    "It may be blocking GitHub, so check manually.")
+    if now.hour >= HEARTBEAT_HOUR and meta.get("last_heartbeat") != now.date().isoformat():
+        active = [t for t in trackers if t.get("enabled", True)]
+        if active:
+            lines = [f"{i}. {t['label']}: {results.get(t['id'], 'not checked yet')}"
+                     for i, t in enumerate(active, 1)]
+            tg.send(f"🫡 Still watching {len(active)} tracker(s), checking every 10 minutes:\n"
+                    + "\n".join(lines))
+        meta["last_heartbeat"] = now.date().isoformat()
+
+    write_json_if_changed(TRACKERS_FILE, trackers)
+    write_json_if_changed(META_FILE, meta)
+    write_json_if_changed(STATE_FILE, state)
+    print("  Done.")
 
 
 if __name__ == "__main__":
-    main()
+    run()

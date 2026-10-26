@@ -1,69 +1,41 @@
-# BMS Ticket Notifier
+# BMS Ticket Notifier (Telegram)
 
-Automatically monitors [BookMyShow](https://in.bookmyshow.com) for ticket availability and sends you an email alert when something changes.
+Fork of [aviiciii/bms-ticket-notifier](https://github.com/aviiciii/bms-ticket-notifier), extended to be run
+entirely from Telegram. GitHub Actions runs it every 10 minutes for free; nothing runs on a PC.
 
-Runs every n minutes via GitHub Actions. (You can set it via cron jobs, tho GH Actions doesn't kick in accurately)
+## Use it
 
-## How It Works
+Send the bot a **BookMyShow movie link** (the movie page or the `/buytickets/` page, any supported city).
 
-1. Fetches showtimes from the BookMyShow API for a given movie URL
-2. Compares results with the previous check (stored in `bms_state.json`)
-3. Sends an HTML email via [Resend](https://resend.com) if anything changed (new shows, dates opening, availability updates)
+1. It starts tracking right away: alert the moment showtimes are listed.
+2. It then offers buttons to narrow it down: **dates**, **theatres**, **time of day**.
+3. When something matches you get a message immediately. If nothing is available you get one note a day at 8 pm IST.
+
+| Command | What it does |
+|---|---|
+| `/list` | everything being tracked, with the last result |
+| `/edit N` | change dates / theatres / time of day |
+| `/pause N`, `/resume N`, `/remove N` | N is the number from `/list` |
+
+Dates: `18-20 Dec, 25 Dec`. Theatres: `PVR, INOX, IMAX`. Send `any` to clear a filter.
+Replies can take up to ~10 minutes, because the bot reads your messages on each run.
+
+**District links** are understood (`district.in/movies/...-movie-tickets-in-<city>-MV...`) but district.in
+returns 403 to GitHub's servers, so those trackers show as blocked unless the watcher runs from another network.
 
 ## Setup
 
-### 1. Fork this repository
+1. Fork this repo. Create a bot with @BotFather.
+2. Repo secrets: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`. Only that chat can control the bot.
+3. Enable the workflow under Actions. Optional email alerts: `RESEND_API_KEY`, `RESEND_TO_EMAIL`, `RESEND_FROM_EMAIL`.
 
-### 2. Set GitHub Secrets
+## Files
 
-Go to **Settings → Secrets and variables → Actions** and add:
+| File | Purpose |
+|---|---|
+| `main.py` | BookMyShow API, change detection, the run loop |
+| `chat.py` | Telegram conversation, link/date parsing |
+| `district.py` | District link parsing and page check |
+| `trackers.json`, `bms_state.json`, `meta.json` | what is tracked, last seen showtimes, bookkeeping (committed by the workflow) |
 
-| Secret | Description |
-|--------|-------------|
-| `RESEND_API_KEY` | API key from [resend.com](https://resend.com) |
-| `RESEND_FROM_EMAIL` | Email address to send notifications (use your own domain email or anything@resend.dev) |
-| `RESEND_TO_EMAIL` | Email address to receive notifications |
-
-### 3. Set GitHub Variables
-
-Go to **Settings → Secrets and variables → Actions → Variables** and add:
-
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `BMS_URL` | BookMyShow ticket page URL | `https://in.bookmyshow.com/movies/chennai/.../ET00123456` |
-| `BMS_DATES` | Dates to monitor (YYYYMMDD, comma-separated). Leave empty to auto-detect from URL. | `20260318,20260319` |
-| `BMS_THEATRE` | Filter by theatre name (substring match, comma-separated) | `PVR,IMAX` |
-| `BMS_TIME` | Filter by time period (comma-separated) | `evening,night` |
-
-**Time periods:** `morning` (6–12), `afternoon` (12–16), `evening` (16–19), `night` (19–24)
-
-### 4. Trigger the workflow
-
-Go to **Actions → BMS Ticket Checker** and click **Run workflow**, or wait for it to run automatically every 30 minutes.
-
-## Local Usage
-
-Requires Python 3.14+ and [uv](https://docs.astral.sh/uv/).
-
-```bash
-uv sync --frozen
-
-export BMS_URL="https://in.bookmyshow.com/movies/chennai/.../ET00123456"
-export BMS_DATES="20260318,20260319"
-export BMS_THEATRE="PVR"
-export BMS_TIME="evening,night"
-export RESEND_API_KEY="re_..."
-export RESEND_TO_EMAIL="you@example.com"
-export RESEND_TO_EMAIL="python@resend.dev"
-
-uv run main.py
-```
-
-## Notifications
-
-You'll receive an email when:
-- A new showtime is added
-- A date opens for booking
-- Seat availability changes (e.g. sold out → available)
-
-Emails show a summary of what changed and the current status of all monitored shows, grouped by theatre.
+Supported cities: see `REGION_MAP` in `main.py`. Tests: `python -m pytest -q`.

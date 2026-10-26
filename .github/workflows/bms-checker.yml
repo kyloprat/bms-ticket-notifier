@@ -2,9 +2,13 @@ name: BMS Ticket Checker
 
 on:
   schedule:
-    # Every 10 minutes (GitHub may run late)
+    # Every 10 minutes (GitHub may run late). Each run also answers Telegram messages.
     - cron: '*/10 * * * *'
   workflow_dispatch:  # Manual trigger button
+
+concurrency:
+  group: bms-checker
+  cancel-in-progress: false
 
 jobs:
   check-tickets:
@@ -32,15 +36,12 @@ jobs:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           RESEND_TO_EMAIL: ${{ secrets.RESEND_TO_EMAIL }}
           RESEND_FROM_EMAIL: ${{ secrets.RESEND_FROM_EMAIL }}
-          BMS_URL: ${{ vars.BMS_URL }}
-          BMS_DATES: ${{ vars.BMS_DATES }}
-          BMS_THEATRE: ${{ vars.BMS_THEATRE }}
-          BMS_TIME: ${{ vars.BMS_TIME }}
         run: uv run main.py
 
       - name: Commit updated state
+        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add bms_state.json meta.json
-          git diff --cached --quiet || (git commit -m "chore: update bms_state.json [skip ci]" && git push)
+          git add trackers.json bms_state.json meta.json
+          git diff --cached --quiet || (git commit -m "chore: update tracker state [skip ci]" && git pull --rebase --autostash && git push)
