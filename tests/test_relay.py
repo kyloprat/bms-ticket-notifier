@@ -11,12 +11,14 @@ from test_bot import DOOMSDAY, TODAY, FakeTg, msg, tap  # noqa: E402
 ENV = {"WEBHOOK_SECRET": "s3cret", "TELEGRAM_BOT_TOKEN": "x", "TELEGRAM_CHAT_ID": "42",
        "GITHUB_TOKEN": "x", "GITHUB_REPO": "o/r"}
 LABEL = lambda link: "Avengers: Doomsday"  # noqa: E731
+TID = "et00439706-bengaluru"
 
 
 class FakeStore:
     def __init__(self, files=None, conflicts=0):
         self.files = {k: (v, f"sha-{k}") for k, v in (files or {}).items()}
         self.writes = []
+        self.dispatched = []
         self.conflicts = conflicts
 
     def get(self, path, default):
@@ -28,40 +30,55 @@ class FakeStore:
             self.conflicts -= 1
             raise relay.Conflict(path)
         assert sha == self.files.get(path, (None, None))[1]
-        self.files[path] = (data, f"sha-{path}-{len(self.writes)}")
+        new_sha = f"sha-{path}-{len(self.writes)}"
+        self.files[path] = (json.loads(json.dumps(data)), new_sha)
         self.writes.append(path)
+        return new_sha
+
+    def dispatch(self, tracker_id):
+        self.dispatched.append(tracker_id)
+        return True
 
 
-def test_link_creates_tracker_and_replies_after_saving():
+def start(store, tg):
+    """Link, then pick Bengaluru on the city buttons."""
+    relay.process(msg(1, DOOMSDAY), store, tg, TODAY, label_fn=LABEL)
+    relay.process(tap(2, "nc:bengaluru"), store, tg, TODAY)
+
+
+def test_link_asks_city_then_creates_tracker_and_starts_a_check():
     store, tg = FakeStore({"meta.json": {"results": {}}}), FakeTg()
     relay.process(msg(1, DOOMSDAY), store, tg, TODAY, label_fn=LABEL)
-    assert store.files["trackers.json"][0][0]["id"] == "et00439706-bengaluru"
-    assert store.writes == ["trackers.json"] and "Tracking started" in tg.texts[0]
+    assert store.writes == ["chat.json"] and "Which city" in tg.last
+    relay.process(tap(2, "nc:bengaluru"), store, tg, TODAY)
+    assert store.files["trackers.json"][0][0]["id"] == TID
+    assert store.dispatched == [TID] and "Checking BookMyShow" in tg.last
+    assert store.files["chat.json"][0]["cards"][TID]["id"] == 99          # the tapped message is the card
 
 
-def test_button_then_text_round_trip_through_the_store():
+def test_typed_text_round_trip_and_new_card_id_is_saved():
     store, tg = FakeStore(), FakeTg()
-    relay.process(msg(1, DOOMSDAY), store, tg, TODAY, label_fn=LABEL)
-    relay.process(tap(2, "set:et00439706-bengaluru:dates"), store, tg, TODAY)
-    assert store.files["chat.json"][0]["awaiting"]["field"] == "dates"
-    relay.process(msg(3, "18-19 Dec"), store, tg, TODAY)
-    assert store.files["trackers.json"][0][0]["dates"] == ["20261218", "20261219"]
-    assert "awaiting" not in store.files["chat.json"][0]
+    start(store, tg)
+    relay.process(msg(3, "18-19 Dec 7 pm"), store, tg, TODAY)
+    t = store.files["trackers.json"][0][0]
+    assert t["dates"] == ["20261218", "20261219"] and t["times"] == ["1900-2000"]
+    assert store.files["chat.json"][0]["cards"][TID]["id"] == 100 + len(tg.sent)   # fresh card remembered
+    assert store.dispatched[-1] == TID                                    # dates changed: check again
 
 
 def test_list_reads_results_written_by_the_checker():
-    store = FakeStore({"trackers.json": [], "meta.json": {"results": {"et00439706-bengaluru": "no showtimes listed yet"}}})
+    store = FakeStore({"trackers.json": [], "meta.json": {"results": {TID: "no showtimes listed yet"}}})
     tg = FakeTg()
-    relay.process(msg(1, DOOMSDAY), store, tg, TODAY, label_fn=LABEL)
-    relay.process(msg(2, "/list"), store, tg, TODAY)
-    assert "no showtimes listed yet" in tg.texts[-1]
+    start(store, tg)
+    relay.process(msg(3, "/list"), store, tg, TODAY)
+    assert "no showtimes listed yet" in tg.last
     assert "meta.json" not in store.writes                      # never written by the relay
 
 
 def test_conflict_is_retried_without_double_replies():
     store, tg = FakeStore(conflicts=1), FakeTg()
     relay.process(msg(1, DOOMSDAY), store, tg, TODAY, label_fn=LABEL)
-    assert len(tg.sent) == 1 and store.writes == ["trackers.json"]
+    assert len(tg.sent) == 1 and store.writes == ["chat.json"]
 
 
 def test_webhook_rejects_wrong_secret_and_ignores_strangers():
@@ -74,7 +91,7 @@ def test_webhook_rejects_wrong_secret_and_ignores_strangers():
     assert relay.handle_webhook("s3cret", stranger, env=ENV, store=store, tg=tg) == 200
     assert store.writes == [] and tg.sent == []
     assert relay.handle_webhook("s3cret", raw, env=ENV, store=store, tg=tg, label_fn=LABEL) == 200
-    assert store.writes == ["trackers.json"]
+    assert store.writes == ["chat.json"]
 
 
 def test_webhook_reports_save_failure_to_the_owner():

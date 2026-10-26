@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from urllib.parse import urlparse
 import requests
 
-from chat import ConsoleTelegram, Telegram, buy_url
+from chat import ConsoleTelegram, Telegram, buy_url, card_text, city_name, done_buttons, main_buttons, title, TIP
 from district import check_district, district_url
 
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
@@ -29,6 +29,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 STATE_FILE = "bms_state.json"
 META_FILE = "meta.json"            # last check / last heartbeat / failure count
 TRACKERS_FILE = "trackers.json"    # what to watch (managed from Telegram)
+CHAT_FILE = "chat.json"            # setup-card message ids (written by the relay, read here)
 HEARTBEAT_HOUR = int(os.getenv("HEARTBEAT_HOUR", "20"))   # IST: one "still watching" note a day, 8 pm
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -291,8 +292,8 @@ def filter_shows(shows, theatre_filter, time_periods, date_codes):
                 tc = 0
             matched = False
             for p in periods:
-                if p in TIME_PERIODS:
-                    lo, hi = TIME_PERIODS[p]
+                if p in TIME_PERIODS or re.fullmatch(r"\d{4}-\d{4}", p):
+                    lo, hi = TIME_PERIODS.get(p) or map(int, p.split("-"))   # "1900-2000" = 7-8 pm
                     if lo <= tc < hi:
                         matched = True
                         break
@@ -566,9 +567,15 @@ def check_bms(t, old, fetch=fetch_bms):
             movie_info = parse_movie_info(data)
         all_dates.extend(parse_dates(data))
         all_shows.extend(parse_shows(data))
+    seen = {}
+    for d in all_dates:
+        seen.setdefault(d.date_code, d.status)
+    catalog = {"name": "" if movie_info["name"] in ("Unknown", "Unknown Movie") else movie_info["name"],
+               "language": movie_info["language"], "dates": [[k, v] for k, v in seen.items()],
+               "venues": sorted({s.venue_name for s in all_shows})} if got else None
     if not all_shows:
         return {"ok": got, "result": "no showtimes listed yet" if got else "BookMyShow gave no data",
-                "state": None, "changes": [], "shows": [], "movie_info": movie_info}
+                "state": None, "changes": [], "shows": [], "movie_info": movie_info, "catalog": catalog}
 
     filtered = filter_shows(all_shows, ",".join(t.get("theatres", [])), ",".join(t.get("times", [])),
                             ",".join(t.get("dates", [])))
@@ -580,13 +587,32 @@ def check_bms(t, old, fetch=fetch_bms):
         theatres = sorted({v["venue"] for v in new_state["shows"].values()})
         changes = [f"🎟️ BOOKINGS OPEN: {len(new_state['shows'])} show/category slots "
                    f"at {len(theatres)} theatre(s)"] + [f"   {x}" for x in theatres[:8]]
-    return {"ok": True, "result": f"{len(filtered)} showtimes listed", "state": new_state,
-            "changes": changes, "shows": filtered, "movie_info": movie_info}
+    return {"ok": True, "result": f"{len(filtered)} matching showtimes", "state": new_state,
+            "changes": changes, "shows": filtered, "movie_info": movie_info, "catalog": catalog}
 
 
-def run(now=None, tg=None, fetch=fetch_bms, district_check=check_district):
+def refresh_cards(tg, trackers, meta, cards):
+    """Re-render each setup card with the latest status; edit only when the text changed."""
+    hashes = meta.setdefault("card_hash", {})
+    for t in trackers:
+        card = cards.get(t["id"]) or {}
+        if not card.get("id") or t.get("source") == "district":
+            continue
+        done = card.get("done")
+        text = card_text(t, meta.get("catalog", {}).get(t["id"]), meta["results"].get(t["id"]),
+                         "✅ Saved. /list shows everything I'm tracking." if done else TIP)
+        if hashes.get(t["id"]) != text and tg.edit(card["id"], text,
+                                                   done_buttons(t["id"]) if done else main_buttons(t["id"])):
+            hashes[t["id"]] = text
+    for tid in [k for k in hashes if not any(t["id"] == k for t in trackers)]:
+        hashes.pop(tid)
+
+
+def run(now=None, tg=None, fetch=fetch_bms, district_check=check_district, only=None):
+    """only: a tracker id the relay asked to check right away (skips the others and the daily note)."""
     now = now or datetime.now(IST)
-    print(f"[{now:%Y-%m-%d %H:%M:%S} IST] BMS Ticket Checker")
+    only = only if only is not None else os.getenv("ONLY_TRACKER", "").strip()
+    print(f"[{now:%Y-%m-%d %H:%M:%S} IST] BMS Ticket Checker" + (f" (only {only})" if only else ""))
     trackers = load_json(TRACKERS_FILE, [])
     meta = load_json(META_FILE, {})
     state = load_state()
@@ -595,16 +621,17 @@ def run(now=None, tg=None, fetch=fetch_bms, district_check=check_district):
     tg = tg or make_telegram()
 
     # Chat (links, buttons, commands) is answered instantly by the relay (relay.py on Vercel),
-    # which owns trackers.json/chat.json. This run only reads trackers.json.
+    # which owns trackers.json/chat.json. This run only reads them.
     meta.pop("tg_offset", None)
 
     # 1. checks
     results = meta.setdefault("results", {})
+    catalog = meta.setdefault("catalog", {})
     bms_ran = bms_ok = False
     for tid in [k for k in state if not any(t["id"] == k for t in trackers)]:
         state.pop(tid)                        # tracker removed in chat
     for t in trackers:
-        if not t.get("enabled", True):
+        if not t.get("enabled", True) or (only and t["id"] != only):
             continue
         epoch = t.get("epoch", 0)
         if state.get(t["id"], {}).get("_epoch", 0) != epoch:
@@ -624,26 +651,33 @@ def run(now=None, tg=None, fetch=fetch_bms, district_check=check_district):
             bms_ok = bms_ok or ok
             if r["state"] is not None:
                 state[t["id"]] = {**r["state"], "_epoch": epoch}
+            if r["catalog"] is not None:
+                catalog[t["id"]] = r["catalog"]
             if r["changes"]:
-                subject = f"BMS Alert: {t['label']} - {len(r['changes'])} change(s)"
+                subject = (f"BMS Alert: {title(t, catalog.get(t['id']))} ({city_name(t['region_slug'])})"
+                           f" - {len(r['changes'])} change(s)")
                 lines = [subject, ""] + r["changes"][:15] + ["", buy_url(t)]
                 tg.send("\n".join(lines))
                 send_email(subject, r["changes"], r["shows"], r["movie_info"])
         results[t["id"]] = result
         print(f"  {t['id']}: {result}")
-    for tid in [k for k in results if not any(t["id"] == k for t in trackers)]:
-        results.pop(tid)
+    for d in (results, catalog):
+        for tid in [k for k in d if not any(t["id"] == k for t in trackers)]:
+            d.pop(tid)
+
+    # 2. keep each setup card in Telegram current (booking status, validated dates/theatres)
+    refresh_cards(tg, trackers, meta, load_json(CHAT_FILE, {}).get("cards", {}))
 
     # 3. one-time warning if BookMyShow keeps returning nothing; one "still watching" note a day
-    if bms_ran:
+    if bms_ran and not only:
         meta["fails"] = 0 if bms_ok else meta.get("fails", 0) + 1
         if meta["fails"] == 3:
             tg.send("⚠️ Can't read BookMyShow: 3 checks in a row got no data. "
                     "It may be blocking GitHub, so check manually.")
-    if now.hour >= HEARTBEAT_HOUR and meta.get("last_heartbeat") != now.date().isoformat():
+    if not only and now.hour >= HEARTBEAT_HOUR and meta.get("last_heartbeat") != now.date().isoformat():
         active = [t for t in trackers if t.get("enabled", True)]
         if active:
-            lines = [f"{i}. {t['label']}: {results.get(t['id'], 'not checked yet')}"
+            lines = [f"{i}. {title(t, catalog.get(t['id']))}: {results.get(t['id'], 'not checked yet')}"
                      for i, t in enumerate(active, 1)]
             tg.send(f"🫡 Still watching {len(active)} tracker(s), checking every 10 minutes:\n"
                     + "\n".join(lines))
