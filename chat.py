@@ -31,7 +31,7 @@ HELP = (
     "/list - what I'm tracking\n"
     "/edit N - change dates, theatres or time of day\n"
     "/pause N, /resume N, /remove N\n"
-    "N is the number shown in /list. Replies can take up to ~10 minutes."
+    "N is the number shown in /list. Checks run every ~10 minutes."
 )
 
 
