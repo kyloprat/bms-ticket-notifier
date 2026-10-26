@@ -10,3 +10,4 @@ wheels/
 .venv
 .env__pycache__/
 .pytest_cache/
+.vercel/

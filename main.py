@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from urllib.parse import urlparse
 import requests
 
-from chat import Chat, ConsoleTelegram, Telegram, buy_url
+from chat import ConsoleTelegram, Telegram, buy_url
 from district import check_district, district_url
 
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
@@ -594,27 +594,26 @@ def run(now=None, tg=None, fetch=fetch_bms, district_check=check_district):
         state = {}
     tg = tg or make_telegram()
 
-    # 1. chat: links, buttons and commands sent since the last run
-    chat = Chat(tg, trackers, meta, state, now.date(), region_ok=lambda slug: slug in REGION_MAP)
-    for update in tg.updates(meta.get("tg_offset")):
-        meta["tg_offset"] = update["update_id"] + 1
-        try:
-            chat.handle(update)
-        except Exception as e:  # noqa: BLE001 - one bad message must not stop the checks
-            print(f"  ❌ chat update failed: {e!r}")
-            tg.send(f"⚠️ Couldn't process that message ({type(e).__name__}).")
+    # Chat (links, buttons, commands) is answered instantly by the relay (relay.py on Vercel),
+    # which owns trackers.json/chat.json. This run only reads trackers.json.
+    meta.pop("tg_offset", None)
 
-    # 2. checks
+    # 1. checks
     results = meta.setdefault("results", {})
     bms_ran = bms_ok = False
+    for tid in [k for k in state if not any(t["id"] == k for t in trackers)]:
+        state.pop(tid)                        # tracker removed in chat
     for t in trackers:
         if not t.get("enabled", True):
             continue
+        epoch = t.get("epoch", 0)
+        if state.get(t["id"], {}).get("_epoch", 0) != epoch:
+            state.pop(t["id"], None)          # resumed in chat: fresh start, alert again if open
         if t.get("source") == "district":
             ok, result, is_open = district_check(t)
             was_open = state.get(t["id"], {}).get("open", False)
             if ok:
-                state[t["id"]] = {"open": is_open}
+                state[t["id"]] = {"open": is_open, "_epoch": epoch}
             if is_open and not was_open:
                 tg.send(f"🎟️ BOOKINGS OPEN on District: {t['label']} ({t['city']})\n{result}\n"
                         f"{district_url(t)}")
@@ -624,7 +623,7 @@ def run(now=None, tg=None, fetch=fetch_bms, district_check=check_district):
             ok, result = r["ok"], r["result"]
             bms_ok = bms_ok or ok
             if r["state"] is not None:
-                state[t["id"]] = r["state"]
+                state[t["id"]] = {**r["state"], "_epoch": epoch}
             if r["changes"]:
                 subject = f"BMS Alert: {t['label']} - {len(r['changes'])} change(s)"
                 lines = [subject, ""] + r["changes"][:15] + ["", buy_url(t)]
@@ -650,7 +649,6 @@ def run(now=None, tg=None, fetch=fetch_bms, district_check=check_district):
                     + "\n".join(lines))
         meta["last_heartbeat"] = now.date().isoformat()
 
-    write_json_if_changed(TRACKERS_FILE, trackers)
     write_json_if_changed(META_FILE, meta)
     write_json_if_changed(STATE_FILE, state)
     print("  Done.")
