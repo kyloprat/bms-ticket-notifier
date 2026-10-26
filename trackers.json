@@ -19,7 +19,9 @@
     "dates": [
       "20261106"
     ],
-    "theatres": [],
+    "theatres": [
+      "pxl"
+    ],
     "times": [
       "evening",
       "night"
