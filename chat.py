@@ -68,7 +68,7 @@ def fetch_label(link: dict) -> str:
     t = {"region_slug": link["region_slug"], "slug": link["slug"], "event_code": link["event_code"]}
     try:
         r = requests.get(page_url(t), headers={"User-Agent": UA, "Accept-Language": "en-IN,en;q=0.9"},
-                         timeout=20)
+                         timeout=8)
         title = re.search(r"<title>([^<]+)</title>", r.text)
         if r.ok and title:
             name = re.split(r"\s+\(\d{4}\)|\s+-\s+Movie|\s+Movie\b|\s+\|", title.group(1))[0].strip()
@@ -219,9 +219,13 @@ def time_buttons(t: dict):
 
 
 class Chat:
-    def __init__(self, tg, trackers: list, meta: dict, state: dict, today: date,
+    """Owns trackers.json and chat.json (`meta` here = pending question). The checker owns
+    the results/state files; `results` is only read, for /list."""
+
+    def __init__(self, tg, trackers: list, meta: dict, today: date, results: dict | None = None,
                  region_ok=lambda slug: True, label_fn=fetch_label):
-        self.tg, self.trackers, self.meta, self.state = tg, trackers, meta, state
+        self.tg, self.trackers, self.meta = tg, trackers, meta
+        self.results = results or {}
         self.today, self.region_ok, self.label_fn = today, region_ok, label_fn
 
     # -- helpers
@@ -366,7 +370,7 @@ class Chat:
             lines = []
             for i, t in enumerate(self.trackers, 1):
                 flag = "" if t.get("enabled", True) else " ⏸ paused"
-                res = self.meta.get("results", {}).get(t["id"], "not checked yet")
+                res = self.results.get(t["id"], "not checked yet")
                 lines.append(f"{i}. {describe(t)}{flag}\n   last: {res}")
             self.tg.send("\n\n".join(lines))
         elif cmd in ("/pause", "/resume", "/remove", "/edit"):
@@ -378,14 +382,12 @@ class Chat:
             elif cmd == "/edit":
                 self._ask_setup(t)
             elif cmd == "/remove":
-                self.trackers.remove(t)
-                self.state.pop(t["id"], None)
-                self.meta.get("results", {}).pop(t["id"], None)
+                self.trackers.remove(t)                 # the checker drops its state next run
                 self.tg.send(f"🗑 Stopped tracking {t['label']}.")
             else:
                 t["enabled"] = cmd == "/resume"
                 if t["enabled"]:
-                    self.state.pop(t["id"], None)       # fresh start: alert if already open
+                    t["epoch"] = t.get("epoch", 0) + 1  # fresh start: alert again if already open
                 self.tg.send(f"{'▶️ Resumed' if t['enabled'] else '⏸ Paused'} {t['label']}.")
         else:
             self.tg.send("Unknown command. /help")

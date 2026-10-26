@@ -68,10 +68,10 @@ def api(venues):
         {"type": "groupList", "data": [{"type": "venueGroup", "data": cards}]}]}}
 
 
-def make_chat(trackers=None, meta=None, state=None, tg=None, region_ok=lambda s: True):
+def make_chat(trackers=None, meta=None, results=None, tg=None, region_ok=lambda s: True):
     tg = tg or FakeTg()
     c = chat.Chat(tg, trackers if trackers is not None else [], meta if meta is not None else {},
-                  state if state is not None else {}, TODAY, region_ok=region_ok,
+                  TODAY, results=results, region_ok=region_ok,
                   label_fn=lambda link: "Avengers: Doomsday")
     return c, tg
 
@@ -158,18 +158,17 @@ def test_theatres_flow_and_time_toggle():
 
 
 def test_commands_list_pause_resume_remove():
-    trackers, meta, state = [], {"results": {"et00439706-bengaluru": "no showtimes listed yet"}}, {}
-    c, tg = make_chat(trackers, meta, state)
+    trackers = []
+    c, tg = make_chat(trackers, results={"et00439706-bengaluru": "no showtimes listed yet"})
     c.handle(msg(1, DOOMSDAY))
-    state["et00439706-bengaluru"] = {"shows": {"x": 1}}
     c.handle(msg(2, "/list"))
     assert "1. Avengers: Doomsday" in tg.texts[-1] and "no showtimes listed yet" in tg.texts[-1]
     c.handle(msg(3, "/pause 1"))
     assert trackers[0]["enabled"] is False and "⏸ paused" in (c.handle(msg(4, "/list")) or tg.texts[-1])
     c.handle(msg(5, "/resume 1"))
-    assert trackers[0]["enabled"] is True and "et00439706-bengaluru" not in state      # fresh start
+    assert trackers[0]["enabled"] is True and trackers[0]["epoch"] == 1      # checker starts fresh
     c.handle(msg(6, "/remove 1"))
-    assert trackers == [] and meta["results"] == {}
+    assert trackers == []
     c.handle(msg(7, "/remove 9"))
     assert "Usage" in tg.texts[-1]
 
@@ -267,13 +266,29 @@ def read(name):
     return json.loads(Path(name).read_text(encoding="utf-8"))
 
 
-def test_run_link_in_chat_is_tracked_and_checked_in_the_same_run(workdir):
+def test_run_reads_trackers_but_never_writes_them_and_ignores_chat(workdir):
+    Path("trackers.json").write_text(json.dumps([doomsday_tracker()]))
+    before = Path("trackers.json").read_bytes()
     tg = FakeTg([msg(1, DOOMSDAY)])
     main.run(now=NOW_MORNING, tg=tg, fetch=lambda *a: api([]))
-    assert read("trackers.json")[0]["id"] == "et00439706-bengaluru"
+    assert Path("trackers.json").read_bytes() == before
     assert read("meta.json")["results"]["et00439706-bengaluru"] == "no showtimes listed yet"
-    assert read("meta.json")["tg_offset"] == 2
-    assert len(tg.sent) == 1                                   # just the "want to narrow it down?" question
+    assert tg.sent == []                                       # chat is the relay's job now
+
+
+def test_run_drops_state_of_removed_trackers_and_restarts_on_resume(workdir):
+    t = doomsday_tracker()
+    Path("trackers.json").write_text(json.dumps([t]))
+    Path("bms_state.json").write_text(json.dumps({"gone-tracker": {"shows": {"x": {}}}}))
+    tg = FakeTg()
+    main.run(now=NOW_MORNING, tg=tg, fetch=lambda *a: api(["PVR Forum"]))
+    assert list(read("bms_state.json")) == ["et00439706-bengaluru"] and len(tg.sent) == 1
+    main.run(now=NOW_MORNING, tg=tg, fetch=lambda *a: api(["PVR Forum"]))
+    assert len(tg.sent) == 1                                   # already alerted
+    t["epoch"] = 1                                             # /resume in chat
+    Path("trackers.json").write_text(json.dumps([t]))
+    main.run(now=NOW_MORNING, tg=tg, fetch=lambda *a: api(["PVR Forum"]))
+    assert len(tg.sent) == 2 and "BOOKINGS OPEN" in tg.texts[-1]
 
 
 def test_run_alerts_immediately_and_only_once(workdir):
@@ -329,12 +344,3 @@ def test_run_does_not_rewrite_files_when_nothing_changed(workdir):
     before = {n: Path(n).stat().st_mtime_ns for n in ("trackers.json", "meta.json", "bms_state.json")}
     main.run(now=NOW_MORNING, tg=FakeTg(), fetch=lambda *a: api([]))
     assert before == {n: Path(n).stat().st_mtime_ns for n in before}
-
-
-def test_run_survives_a_bad_chat_message(workdir, monkeypatch):
-    Path("trackers.json").write_text(json.dumps([doomsday_tracker()]))
-    tg = FakeTg([msg(1, "/list")])
-    monkeypatch.setattr(chat.Chat, "_command", lambda self, text: 1 / 0)
-    main.run(now=NOW_MORNING, tg=tg, fetch=lambda *a: api([]))
-    assert any("Couldn't process" in t for t in tg.texts)
-    assert read("meta.json")["tg_offset"] == 2                 # the bad message isn't retried forever
