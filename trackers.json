@@ -20,7 +20,9 @@
       "20261106"
     ],
     "theatres": [],
-    "times": [],
+    "times": [
+      "evening"
+    ],
     "enabled": true
   }
 ]
