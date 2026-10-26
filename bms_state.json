@@ -1,1 +1,15 @@
-{}
+{
+  "et00451914-kolkata": {
+    "shows": {},
+    "dates": {
+      "20261105": "AVAILABLE",
+      "20261106": "BOOKABLE",
+      "20261107": "AVAILABLE",
+      "20261108": "AVAILABLE",
+      "20261109": "AVAILABLE",
+      "20261110": "NOT_OPEN",
+      "20261111": "NOT_OPEN"
+    },
+    "_epoch": 0
+  }
+}
