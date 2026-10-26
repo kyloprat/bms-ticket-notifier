@@ -21,7 +21,8 @@
     ],
     "theatres": [],
     "times": [
-      "evening"
+      "evening",
+      "night"
     ],
     "enabled": true
   }
