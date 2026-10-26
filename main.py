@@ -585,7 +585,7 @@ def humanize(minutes):
 
 def movie_page_url():
     """The movie page works before bookings open; /buytickets/ shows 'no shows' until then."""
-    return re.sub(r"/buytickets/(ET\d+)/?", r"/", CONFIG["url"])
+    return re.sub(r"/buytickets/(ET\d+)/?", r"/\1", CONFIG["url"])
 
 
 def finish(meta, now, hb_due, phase, schedule, result, ok):
