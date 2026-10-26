@@ -11,7 +11,7 @@ import re
 import sys
 import json
 from html import escape
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 import requests
@@ -37,6 +37,10 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 STATE_FILE = "bms_state.json"
+META_FILE = "meta.json"            # last check / last heartbeat / failure count
+SCHEDULE_FILE = "schedule.json"    # how often to really check, by date
+HEARTBEAT_HOUR = int(os.getenv("HEARTBEAT_HOUR", "10"))   # IST
+IST = timezone(timedelta(hours=5, minutes=30))
 
 # ──────────────────────────────────────────────────────────────────────
 # CONSTANTS
@@ -551,11 +555,74 @@ def send_telegram(subject, changes, url):
 
 
 # ──────────────────────────────────────────────────────────────────────
+# SCHEDULE + HEARTBEAT (cron fires every 10 min; this decides if a check is due)
+# ──────────────────────────────────────────────────────────────────────
+def load_json(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+
+
+def current_phase(schedule, now):
+    phases = schedule.get("phases") or [{"until": "", "every_minutes": 10}]
+    for ph in phases:
+        if not ph.get("until") or now < datetime.fromisoformat(ph["until"]).replace(tzinfo=IST):
+            return ph
+    return phases[-1]
+
+
+def humanize(minutes):
+    if minutes >= 1440:
+        return "once a day"
+    if minutes >= 120:
+        return f"every {minutes // 60} hours"
+    if minutes >= 60:
+        return "every hour"
+    return f"every {minutes} minutes"
+
+
+def finish(meta, now, hb_due, phase, schedule, result, ok):
+    """Record the check; send the daily 'still watching' note and a one-time failure warning."""
+    meta["last_check"] = now.isoformat(timespec="minutes")
+    meta["last_result"] = result
+    meta["fails"] = 0 if ok else meta.get("fails", 0) + 1
+    label = schedule.get("label", "the movie")
+    if meta["fails"] == 3:
+        send_telegram(f"⚠️ Can't read BookMyShow for {label}", [
+            "3 checks in a row got no data. The site may be blocking GitHub, so check manually."],
+            CONFIG["url"])
+    if hb_due:
+        lines = [f"Last check: {result}",
+                 f"Checking {humanize(phase['every_minutes'])} for now."]
+        if schedule.get("estimate"):
+            lines.append(schedule["estimate"])
+        send_telegram(f"🫡 Still watching {label}", lines, CONFIG["url"])
+        meta["last_heartbeat"] = now.date().isoformat()
+    with open(META_FILE, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+
+
+# ──────────────────────────────────────────────────────────────────────
 # MAIN
 # ──────────────────────────────────────────────────────────────────────
 def main():
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{now_str}] BMS Ticket Checker — CI mode")
+    now = datetime.now(IST)
+    print(f"[{now:%Y-%m-%d %H:%M:%S} IST] BMS Ticket Checker — CI mode")
+
+    schedule = load_json(SCHEDULE_FILE, {})
+    meta = load_json(META_FILE, {})
+    phase = current_phase(schedule, now)
+    every = int(phase["every_minutes"])
+    hb_due = (now.hour >= HEARTBEAT_HOUR
+              and meta.get("last_heartbeat") != now.date().isoformat())
+    last = meta.get("last_check")
+    elapsed = ((now - datetime.fromisoformat(last)).total_seconds() / 60) if last else 1e9
+    forced = os.getenv("GITHUB_EVENT_NAME") == "workflow_dispatch"
+    if not (forced or hb_due or elapsed >= every - 5):
+        print(f"  ⏭️  Not due: phase checks {humanize(every)}, last check {elapsed:.0f} min ago.")
+        return
 
     # Parse config
     parsed = parse_bms_url(CONFIG["url"])
@@ -587,6 +654,7 @@ def main():
     all_shows = []
     all_dates = []
     movie_info = {"name": "Unknown", "language": ""}
+    got_data = False
 
     for dc in date_list:
         data = fetch_bms(event_code, dc, region_code,
@@ -594,6 +662,7 @@ def main():
         if not data:
             print(f"  ⚠️  No data for date {dc or '(default)'}")
             continue
+        got_data = True
 
         if movie_info["name"] == "Unknown":
             movie_info = parse_movie_info(data)
@@ -603,7 +672,9 @@ def main():
 
     if not all_shows:
         print("  ❌ No showtimes found.")
-        sys.exit(0)
+        finish(meta, now, hb_due, phase, schedule,
+               "no showtimes listed yet" if got_data else "BookMyShow gave no data", got_data)
+        return
 
     print(f"  🎬 {movie_info['name']}  {movie_info['language']}")
 
@@ -651,6 +722,7 @@ def main():
         fmt = f"|{s.screen_attr}" if s.screen_attr else ""
         print(f"    {s.venue_name} — {s.time}{fmt} [{s.date_code}] — {cats}")
 
+    finish(meta, now, hb_due, phase, schedule, f"{len(filtered)} showtimes listed", True)
     print("\n  Done.")
 
 
