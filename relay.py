@@ -4,6 +4,10 @@ Runs as a Vercel function (api/telegram.py, deployed by deploy-relay.sh). It own
 trackers.json and chat.json and only reads meta.json (for /list). The GitHub Actions
 checker (main.py) owns meta.json and bms_state.json, so the two never edit the same file.
 
+New trackers (and date/city changes) start a one-tracker checker run right away
+(workflow_dispatch), because BookMyShow doesn't answer Vercel's servers; that run fills in the
+setup card. The token needs Contents: write and Actions: write on this repo.
+
 Env: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, WEBHOOK_SECRET, GITHUB_TOKEN, GITHUB_REPO.
 """
 from __future__ import annotations
@@ -16,7 +20,7 @@ from datetime import datetime
 
 import requests
 
-from chat import Chat, Telegram
+from chat import Chat, Telegram, slug_label
 from main import IST, REGION_MAP
 
 
@@ -39,7 +43,7 @@ class GitHubStore:
         body = r.json()
         return json.loads(base64.b64decode(body["content"]).decode("utf-8") or "null") or default, body["sha"]
 
-    def put(self, path: str, data, sha: str | None, message: str) -> None:
+    def put(self, path: str, data, sha: str | None, message: str) -> str:
         payload = {"message": message, "branch": self.branch, "content": base64.b64encode(
             (json.dumps(data, indent=2, ensure_ascii=False) + "\n").encode("utf-8")).decode("ascii")}
         if sha:
@@ -48,6 +52,17 @@ class GitHubStore:
         if r.status_code in (409, 422):
             raise Conflict(path)
         r.raise_for_status()
+        return r.json()["content"]["sha"]
+
+    def dispatch(self, tracker_id: str) -> bool:
+        """Start a checker run for one tracker now. False if the token can't (needs Actions: write)."""
+        try:
+            r = requests.post(f"{self.url.rsplit('/contents', 1)[0]}/actions/workflows/bms-checker.yml/dispatches",
+                              json={"ref": self.branch, "inputs": {"only": tracker_id}},
+                              headers=self.headers, timeout=10)
+            return r.status_code == 204
+        except requests.RequestException:
+            return False
 
 
 class Buffered:
@@ -57,13 +72,17 @@ class Buffered:
         self.chat_id = chat_id
         self.calls: list[tuple[str, tuple]] = []
 
-    def send(self, text, buttons=None):
-        self.calls.append(("send", (text, buttons)))
+    def send(self, text, buttons=None, on_id=None):
+        self.calls.append(("send", (text, buttons, on_id)))
+
+    def edit(self, message_id, text, buttons=None):
+        self.calls.append(("edit", (message_id, text, buttons)))
+        return True
 
     def edit_buttons(self, message_id, buttons):
         self.calls.append(("edit_buttons", (message_id, buttons)))
 
-    def answer(self, callback_id):
+    def answer(self, callback_id, text=""):
         self.calls.append(("answer", (callback_id,)))
 
     def flush(self, tg) -> None:
@@ -82,19 +101,29 @@ def process(update: dict, store, tg, today, label_fn=None, attempts: int = 3) ->
         meta, _ = store.get("meta.json", {})
         before_t, before_c = _dump(trackers), _dump(chat_state)
         out = Buffered(tg.chat_id)
-        kw = {"label_fn": label_fn} if label_fn else {}
-        Chat(out, trackers, chat_state, today, results=meta.get("results", {}),
-             region_ok=lambda slug: slug in REGION_MAP, **kw).handle(update)
+        # BookMyShow pages don't answer Vercel either; the checker fills in the real name later.
+        kw = {"label_fn": label_fn or (lambda link: slug_label(link["slug"]))}
+        chat = Chat(out, trackers, chat_state, today, results=meta.get("results", {}),
+                    catalog=meta.get("catalog", {}), region_ok=lambda slug: slug in REGION_MAP, **kw)
+        chat.handle(update)
         try:
             if _dump(trackers) != before_t:
                 store.put("trackers.json", trackers, t_sha, "chat: update trackers [skip ci]")
             if _dump(chat_state) != before_c:
-                store.put("chat.json", chat_state, c_sha, "chat: update conversation [skip ci]")
+                c_sha = store.put("chat.json", chat_state, c_sha, "chat: update conversation [skip ci]")
         except Conflict:
             if attempt == attempts - 1:
                 raise
             continue
-        out.flush(tg)
+        if chat.lookups and hasattr(store, "dispatch"):
+            store.dispatch(chat.lookups[-1])
+        saved = _dump(chat_state)
+        out.flush(tg)                          # may record new setup-card message ids
+        if _dump(chat_state) != saved:
+            try:
+                store.put("chat.json", chat_state, c_sha, "chat: remember setup card [skip ci]")
+            except Conflict:
+                pass                           # a newer chat.json already won; the next card fixes it
         return
 
 

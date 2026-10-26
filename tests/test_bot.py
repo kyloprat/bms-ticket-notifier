@@ -24,28 +24,42 @@ DOOMSDAY_BUY = "https://in.bookmyshow.com/movies/bengaluru/avengers-doomsday/buy
 class FakeTg:
     chat_id = "42"
 
-    def __init__(self, updates=None):
-        self.inbox = list(updates or [])
+    def __init__(self):
         self.sent = []          # (text, buttons)
-        self.edits = []
+        self.edits = []         # (message_id, buttons) for button-only edits
+        self.edited = []        # (message_id, text, buttons)
+        self.log = []           # (text, buttons) of every new or edited message, in order
 
-    def send(self, text, buttons=None):
+    def send(self, text, buttons=None, on_id=None):
         self.sent.append((text, buttons))
-        return len(self.sent)
+        self.log.append((text, buttons))
+        if on_id:
+            on_id(100 + len(self.sent))
+        return 100 + len(self.sent)
+
+    def edit(self, message_id, text, buttons=None):
+        self.edited.append((message_id, text, buttons))
+        self.log.append((text, buttons))
+        return True
 
     def edit_buttons(self, message_id, buttons):
         self.edits.append((message_id, buttons))
 
-    def answer(self, callback_id):
+    def answer(self, callback_id, text=""):
         pass
-
-    def updates(self, offset):
-        out = [u for u in self.inbox if offset is None or u["update_id"] >= offset]
-        return out
 
     @property
     def texts(self):
         return [t for t, _ in self.sent]
+
+    @property
+    def last(self):
+        """Latest text the user sees (a new message or an edited card)."""
+        return self.log[-1][0]
+
+    @property
+    def last_data(self):
+        return {b[1] for row in (self.log[-1][1] or []) for b in row}
 
 
 def msg(uid, text, chat_id=42):
@@ -68,12 +82,19 @@ def api(venues):
         {"type": "groupList", "data": [{"type": "venueGroup", "data": cards}]}]}}
 
 
-def make_chat(trackers=None, meta=None, results=None, tg=None, region_ok=lambda s: True):
+def make_chat(trackers=None, meta=None, results=None, tg=None, catalog=None):
     tg = tg or FakeTg()
     c = chat.Chat(tg, trackers if trackers is not None else [], meta if meta is not None else {},
-                  TODAY, results=results, region_ok=region_ok,
-                  label_fn=lambda link: "Avengers: Doomsday")
+                  TODAY, results=results, catalog=catalog, label_fn=lambda link: "Avengers: Doomsday")
     return c, tg
+
+
+RAMAYANA_KOL = "https://in.bookmyshow.com/movies/kolkata/namit-malhotras-ramayana-hindi/ET00451914"
+RAMAYANA_SHARE = ("All that you would like to explore and know about the movie Namit Malhotra's Ramayana - "
+                  f"(Hindi) {RAMAYANA_KOL} @Bookmyshow")
+OPEN_CAT = {"name": "Namit Malhotra's Ramayana", "language": "Hindi  •  2D",
+            "dates": [["20261105", "BOOKABLE"], ["20261106", "AVAILABLE"], ["20261109", "NOT_OPEN"]],
+            "venues": ["INOX: City Center, Salt Lake", "PVR: Mani Square"]}
 
 
 # ── links and dates ─────────────────────────────────────────────────────
@@ -83,6 +104,7 @@ def test_parse_link_movie_page_and_buytickets_and_query():
         assert link == {"event_code": "ET00439706", "region_slug": "bengaluru", "slug": "avengers-doomsday"}
     assert chat.parse_link("https://example.com/movies/x/y/ET00439706") is None
     assert chat.parse_link("https://in.bookmyshow.com/movies/bengaluru") is None
+    assert chat.share_title(RAMAYANA_SHARE) == "Namit Malhotra's Ramayana - (Hindi)"
 
 
 def test_buy_and_page_urls():
@@ -97,95 +119,149 @@ def test_parse_dates():
     assert chat.parse_dates("Dec 18th and 2027-01-02", TODAY) == ["20261218", "20270102"]
     assert chat.parse_dates("20261218", TODAY) == ["20261218"]
     assert chat.parse_dates("5 Jan", TODAY) == ["20270105"]        # already past this year -> next year
+    assert chat.parse_dates("tomorrow", TODAY) == ["20261027"]
     for bad in ("someday", "31 Feb", "20-10 Dec", "1-30 Dec"):
         with pytest.raises(ValueError):
             chat.parse_dates(bad, TODAY)
 
 
+def test_parse_query_one_line_requests():
+    q = chat.parse_query
+    assert q("6 Nov 7-8 PM PXL", TODAY) == {"times": ["1900-2000"], "dates": ["20261106"], "theatres": ["pxl"]}
+    assert q("18-20 Dec, evening and night", TODAY) == {
+        "times": ["evening", "night"], "dates": ["20261218", "20261219", "20261220"]}
+    assert q("PVR Orion, INOX", TODAY) == {"theatres": ["pvr orion", "inox"]}
+    assert q("after 9 pm", TODAY) == {"times": ["2100-2400"]}
+    assert q("7 pm on Dec 18", TODAY) == {"times": ["1900-2000"], "dates": ["20261218"]}
+    assert q("11-1 pm", TODAY) == {"times": ["1100-1300"]}
+    assert q("", TODAY) == {}
+    with pytest.raises(ValueError):
+        q("31 Feb", TODAY)
+
+
+def test_fmt_time_and_range_filter():
+    assert chat.fmt_time("1900-2000") == "7-8 pm" and chat.fmt_time("1100-1300") == "11 am-1 pm"
+    assert chat.fmt_time("2100-2400") == "9 pm-midnight" and chat.fmt_time("evening") == "Evening"
+    shows = main.parse_shows(api(["PVR Forum"]))                         # one show at 19:20
+    assert main.filter_shows(shows, "", "1900-2000", "") == shows
+    assert main.filter_shows(shows, "", "2000-2100", "") == []
+
+
 # ── conversation ────────────────────────────────────────────────────────
-def test_link_starts_tracking_and_offers_buttons():
-    trackers = []
-    c, tg = make_chat(trackers)
-    c.handle(msg(1, DOOMSDAY))
-    assert [t["id"] for t in trackers] == ["et00439706-bengaluru"]
-    assert trackers[0]["label"] == "Avengers: Doomsday" and trackers[0]["enabled"]
-    text, buttons = tg.sent[0]
-    assert "alert when bookings open" in text
-    assert {b[1] for row in buttons for b in row} == {
-        "set:et00439706-bengaluru:dates", "set:et00439706-bengaluru:theatres",
-        "set:et00439706-bengaluru:times", "set:et00439706-bengaluru:done"}
-
-
-def test_same_link_twice_does_not_duplicate():
-    trackers = []
-    c, tg = make_chat(trackers)
-    c.handle(msg(1, DOOMSDAY))
-    c.handle(msg(2, DOOMSDAY_BUY))
-    assert len(trackers) == 1 and "Already tracking" in tg.texts[1]
-
-
-def test_dates_flow_via_button_then_text():
+def test_link_asks_city_then_shows_one_card():
     trackers, meta = [], {}
     c, tg = make_chat(trackers, meta)
-    c.handle(msg(1, DOOMSDAY))
-    c.handle(tap(2, "set:et00439706-bengaluru:dates"))
-    assert meta["awaiting"] == {"id": "et00439706-bengaluru", "field": "dates"}
-    c.handle(msg(3, "someday"))
-    assert "Couldn't read" in tg.texts[-1] and meta["awaiting"]            # keeps waiting
-    c.handle(msg(4, "18-19 Dec"))
-    assert trackers[0]["dates"] == ["20261218", "20261219"] and "awaiting" not in meta
-    c.handle(tap(5, "set:et00439706-bengaluru:dates"))
-    c.handle(msg(6, "any"))
-    assert trackers[0]["dates"] == []
+    c.handle(msg(1, RAMAYANA_SHARE))
+    assert trackers == [] and "Which city" in tg.last and "Namit Malhotra's Ramayana" in tg.last
+    assert tg.last_data >= {"nc:bengaluru", "nc:kolkata"}
+    assert tg.log[-1][1][0][0] == ("Bengaluru", "nc:bengaluru")          # home city first
+    c.handle(tap(2, "nc:bengaluru"))
+    assert [t["id"] for t in trackers] == ["et00451914-bengaluru"]
+    assert tg.edited[-1][0] == 99 and "📍 Bengaluru" in tg.last and "Checking BookMyShow" in tg.last
+    assert meta["cards"]["et00451914-bengaluru"]["id"] == 99 and c.lookups == ["et00451914-bengaluru"]
+    assert tg.last_data == {f"set:et00451914-bengaluru:{x}" for x in ("dates", "theatres", "times", "city", "done")}
 
 
-def test_theatres_flow_and_time_toggle():
+def test_typed_line_updates_everything_and_validates_against_bookmyshow():
+    trackers, meta = [], {}
+    c, tg = make_chat(trackers, meta, catalog={"et00451914-kolkata": OPEN_CAT},
+                      results={"et00451914-kolkata": "0 matching showtimes"})
+    c.handle(msg(1, RAMAYANA_KOL))
+    c.handle(tap(2, "nc:kolkata"))
+    assert "🟢 Bookings OPEN: 5 Nov - 6 Nov · 2 theatre(s)" in tg.last
+    c.handle(tap(3, "set:et00451914-kolkata:dates"))
+    c.handle(msg(4, "6 Nov 7-8 PM PXL"))                                # what was rejected before
+    t = trackers[0]
+    assert (t["dates"], t["times"], t["theatres"]) == (["20261106"], ["1900-2000"], ["pxl"])
+    assert "6 Nov (open)" in tg.last and "pxl (not listed yet)" in tg.last and "7-8 pm" in tg.last
+    assert "Updated dates, time, theatres" in tg.last
+    assert tg.sent[-1][0] == tg.last and tg.edits[-1] == (99, [])        # fresh card; old one stripped
+    assert meta["cards"][t["id"]]["id"] == 100 + len(tg.sent)
+    c.handle(msg(5, "someday soon"))
+    assert t["theatres"] == ["someday soon"]                             # free text = theatre name
+    c.handle(tap(6, "set:et00451914-kolkata:dates"))
+    c.handle(msg(7, "someday"))
+    assert "No date in 'someday'" in tg.last and t["dates"] == ["20261106"]
+
+
+def test_date_and_theatre_buttons_come_from_bookmyshow():
+    trackers, meta = [], {}
+    c, tg = make_chat(trackers, meta, catalog={"et00451914-kolkata": OPEN_CAT})
+    c.handle(msg(1, RAMAYANA_KOL))
+    c.handle(tap(2, "nc:kolkata"))
+    c.handle(tap(3, "set:et00451914-kolkata:dates"))
+    labels = [b[0] for row in tg.log[-1][1] for b in row]
+    assert labels[:3] == ["5 Nov", "6 Nov", "⏳ 9 Nov"]
+    c.handle(tap(4, "dt:et00451914-kolkata:20261106"))
+    assert trackers[0]["dates"] == ["20261106"] and "✅ 6 Nov" in {b[0] for row in tg.log[-1][1] for b in row}
+    c.handle(tap(5, "set:et00451914-kolkata:theatres"))
+    c.handle(tap(6, "vn:et00451914-kolkata:1"))
+    assert trackers[0]["theatres"] == ["pvr: mani square"] and "pvr: mani square (1 listed)" in tg.last
+    c.handle(tap(7, "vn:et00451914-kolkata:1"))
+    assert trackers[0]["theatres"] == []
+    c.handle(tap(8, "set:et00451914-kolkata:times"))
+    c.handle(tap(9, "tm:et00451914-kolkata:night"))
+    c.handle(msg(10, "7-8 pm"))
+    assert trackers[0]["times"] == ["1900-2000"]
+    c.handle(tap(11, "set:et00451914-kolkata:done"))
+    assert "Saved" in tg.last and tg.last_data == {"set:et00451914-kolkata:edit"}
+    assert meta["cards"]["et00451914-kolkata"]["done"] is True
+
+
+def test_city_button_moves_tracker():
     trackers, meta = [], {}
     c, tg = make_chat(trackers, meta)
-    c.handle(msg(1, DOOMSDAY))
-    c.handle(tap(2, "set:et00439706-bengaluru:theatres"))
-    c.handle(msg(3, "PVR, INOX ,IMAX"))
-    assert trackers[0]["theatres"] == ["pvr", "inox", "imax"]
-    c.handle(tap(4, "set:et00439706-bengaluru:times"))
-    c.handle(tap(5, "tm:et00439706-bengaluru:evening"))
-    c.handle(tap(6, "tm:et00439706-bengaluru:night"))
-    assert trackers[0]["times"] == ["evening", "night"]
-    c.handle(tap(7, "tm:et00439706-bengaluru:evening"))
-    assert trackers[0]["times"] == ["night"]
-    assert tg.edits and any("✅ Night" in b[0] for row in tg.edits[-1][1] for b in row)
-    c.handle(tap(8, "tm:et00439706-bengaluru:any"))
-    assert trackers[0]["times"] == []
+    c.handle(msg(1, RAMAYANA_KOL))
+    c.handle(tap(2, "nc:kolkata"))
+    c.handle(tap(3, "set:et00451914-kolkata:city"))
+    c.handle(tap(4, "ct:et00451914-kolkata:bengaluru"))
+    assert trackers[0]["id"] == "et00451914-bengaluru" and trackers[0]["region_slug"] == "bengaluru"
+    assert "et00451914-bengaluru" in meta["cards"] and "Switched to Bengaluru" in tg.last
+    c.handle(msg(5, RAMAYANA_KOL))
+    assert "Already tracking in: Bengaluru" in tg.last
 
 
-def test_commands_list_pause_resume_remove():
+def test_same_city_twice_does_not_duplicate():
     trackers = []
-    c, tg = make_chat(trackers, results={"et00439706-bengaluru": "no showtimes listed yet"})
+    c, tg = make_chat(trackers)
+    for i in (1, 3):
+        c.handle(msg(i, DOOMSDAY))
+        c.handle(tap(i + 1, "nc:bengaluru"))
+    assert len(trackers) == 1 and "Already tracking this" in tg.last
+
+
+def test_commands_list_pause_resume_remove_edit():
+    trackers, meta = [], {}
+    c, tg = make_chat(trackers, meta, results={"et00439706-bengaluru": "no showtimes listed yet"})
     c.handle(msg(1, DOOMSDAY))
-    c.handle(msg(2, "/list"))
-    assert "1. Avengers: Doomsday" in tg.texts[-1] and "no showtimes listed yet" in tg.texts[-1]
-    c.handle(msg(3, "/pause 1"))
-    assert trackers[0]["enabled"] is False and "⏸ paused" in (c.handle(msg(4, "/list")) or tg.texts[-1])
-    c.handle(msg(5, "/resume 1"))
+    c.handle(tap(2, "nc:bengaluru"))
+    c.handle(msg(3, "/list"))
+    assert "1. Avengers: Doomsday (Bengaluru)" in tg.last and "no showtimes listed yet" in tg.last
+    c.handle(msg(4, "/pause 1"))
+    c.handle(msg(5, "/list"))
+    assert trackers[0]["enabled"] is False and "⏸ paused" in tg.last
+    c.handle(msg(6, "/resume 1"))
     assert trackers[0]["enabled"] is True and trackers[0]["epoch"] == 1      # checker starts fresh
-    c.handle(msg(6, "/remove 1"))
-    assert trackers == []
-    c.handle(msg(7, "/remove 9"))
-    assert "Usage" in tg.texts[-1]
+    c.handle(msg(7, "/edit 1"))
+    assert "Avengers: Doomsday" in tg.last and "set:et00439706-bengaluru:dates" in tg.last_data
+    c.handle(msg(8, "/remove 1"))
+    assert trackers == [] and meta["cards"] == {}
+    c.handle(msg(9, "/remove 9"))
+    assert "Usage" in tg.last
 
 
 def test_other_chats_are_ignored():
     trackers = []
     c, tg = make_chat(trackers)
     c.handle(msg(1, DOOMSDAY, chat_id=666))
-    c.handle(tap(2, "set:x:done", chat_id=666))
-    assert trackers == [] and tg.sent == []
+    c.handle(tap(2, "nc:bengaluru", chat_id=666))
+    assert trackers == [] and tg.log == []
 
 
-def test_unknown_city_is_refused():
-    trackers = []
-    c, tg = make_chat(trackers, region_ok=lambda s: s == "bengaluru")
-    c.handle(msg(1, "https://in.bookmyshow.com/movies/atlantis/avengers-doomsday/ET00439706"))
-    assert trackers == [] and "don't know the city" in tg.texts[0]
+def test_stray_text_without_a_card_points_to_help():
+    c, tg = make_chat()
+    c.handle(msg(1, "hello"))
+    assert "Send me a BookMyShow movie link" in tg.last
 
 
 def test_district_link_with_and_without_city():
@@ -269,7 +345,7 @@ def read(name):
 def test_run_reads_trackers_but_never_writes_them_and_ignores_chat(workdir):
     Path("trackers.json").write_text(json.dumps([doomsday_tracker()]))
     before = Path("trackers.json").read_bytes()
-    tg = FakeTg([msg(1, DOOMSDAY)])
+    tg = FakeTg()
     main.run(now=NOW_MORNING, tg=tg, fetch=lambda *a: api([]))
     assert Path("trackers.json").read_bytes() == before
     assert read("meta.json")["results"]["et00439706-bengaluru"] == "no showtimes listed yet"
@@ -344,3 +420,28 @@ def test_run_does_not_rewrite_files_when_nothing_changed(workdir):
     before = {n: Path(n).stat().st_mtime_ns for n in ("trackers.json", "meta.json", "bms_state.json")}
     main.run(now=NOW_MORNING, tg=FakeTg(), fetch=lambda *a: api([]))
     assert before == {n: Path(n).stat().st_mtime_ns for n in before}
+
+
+def test_run_saves_catalog_and_refreshes_the_card_only_when_it_changes(workdir):
+    t = doomsday_tracker(theatres=["pxl"])
+    Path("trackers.json").write_text(json.dumps([t]))
+    Path("chat.json").write_text(json.dumps({"cards": {t["id"]: {"id": 7, "done": False}}}))
+    tg = FakeTg()
+    main.run(now=NOW_MORNING, tg=tg, fetch=lambda *a: api([]))
+    assert read("meta.json")["catalog"][t["id"]]["venues"] == []
+    assert tg.edited[-1][0] == 7 and "Bookings not open yet" in tg.edited[-1][1]
+    main.run(now=NOW_MORNING, tg=tg, fetch=lambda *a: api([]))
+    assert len(tg.edited) == 1                                     # unchanged: no edit
+    main.run(now=NOW_MORNING, tg=tg, fetch=lambda *a: api(["INOX Garuda"]))
+    assert read("meta.json")["catalog"][t["id"]]["venues"] == ["INOX Garuda"]
+    assert "pxl (not listed yet)" in tg.edited[-1][1] and "Bookings OPEN" in tg.edited[-1][1]
+    assert tg.sent == []                                           # pxl not listed: no alert yet
+
+
+def test_run_only_checks_one_tracker_and_skips_the_daily_note(workdir):
+    a, b = doomsday_tracker(), doomsday_tracker(id="other", region_slug="kolkata")
+    Path("trackers.json").write_text(json.dumps([a, b]))
+    tg = FakeTg()
+    main.run(now=NOW_8PM, tg=tg, fetch=lambda *a: api([]), only="other")
+    assert list(read("meta.json")["results"]) == ["other"] and tg.sent == []
+    assert "last_heartbeat" not in read("meta.json")

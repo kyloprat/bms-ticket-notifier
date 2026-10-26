@@ -13,7 +13,7 @@ cat > "$out/pyproject.toml" <<'TOML'
 name = "bms-ticket-relay"
 version = "0.1.0"
 requires-python = ">=3.12"
-dependencies = ["requests>=2.32"]
+dependencies = ["requests>=2.32", "tzdata"]
 
 [tool.vercel]
 entrypoint = "api.telegram:handler"

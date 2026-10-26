@@ -4,7 +4,12 @@ on:
   schedule:
     # Every 10 minutes (GitHub may run late). Chat replies come from the relay (relay.py on Vercel).
     - cron: '3-59/10 * * * *'  # off the :00 peak, when GitHub drops the most scheduled runs
-  workflow_dispatch:  # Manual trigger button
+  workflow_dispatch:  # Manual trigger button; the relay also starts one for a new tracker
+    inputs:
+      only:
+        description: 'Check just this tracker id (empty = all)'
+        required: false
+        default: ''
 
 concurrency:
   group: bms-checker
@@ -36,6 +41,7 @@ jobs:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           RESEND_TO_EMAIL: ${{ secrets.RESEND_TO_EMAIL }}
           RESEND_FROM_EMAIL: ${{ secrets.RESEND_FROM_EMAIL }}
+          ONLY_TRACKER: ${{ inputs.only }}
         run: uv run main.py
 
       - name: Commit updated state
